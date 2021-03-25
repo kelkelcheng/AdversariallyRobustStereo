@@ -1,4 +1,6 @@
 # RobustStereoMatching
+To download checkpoint files for our method, go to https://drive.google.com/drive/folders/1d4hjVRCBS2Pe1h9CooW8651wKxk6McmX?usp=sharing and download all files to checkpoint/MCTNet/
+
 
 To test our trained model:<br />
 python test.py --left_image=examples/left.png --right_image=examples/right.png --backbone=1
