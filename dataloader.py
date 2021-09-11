@@ -8,7 +8,7 @@ import sys
 
 def readPFM(file): 
     with open(file, "rb") as f:
-            # Line 1: PF=>RGB (3 channels), Pf=>Greyscale (1 channel)
+        # Line 1: PF=>RGB (3 channels), Pf=>Greyscale (1 channel)
         type = f.readline().decode('latin-1')
         if "PF" in type:
             channels = 3
@@ -39,7 +39,7 @@ def readPFM(file):
         img = unpack(fmt, buffer)
         img = np.reshape(img, (height, width))
         img = np.flipud(img)
-#        quit()
+        #        quit()
     return img, height, width
 
 def train_transform(temp_data, crop_height, crop_width, left_right=False, shift=0):
@@ -350,7 +350,6 @@ def load_data_md(file_path, current_file, method=1):
 class DatasetFromList(data.Dataset): 
     def __init__(self, data_path, file_list, crop_size=[256, 256], training=True, left_right=False, dataset=0, shift=0, method=0):
         super(DatasetFromList, self).__init__()
-        #self.image_filenames = [join(image_dir, x) for x in listdir(image_dir) if is_image_file(x)]
         f = open(file_list, 'r')
         self.data_path = data_path
         self.file_list = f.readlines()
@@ -363,7 +362,6 @@ class DatasetFromList(data.Dataset):
         self.method = method
 
     def __getitem__(self, index):
-    #    print self.file_list[index]
         if self.dataset==0:
             temp_data = load_subset_data(self.data_path, self.file_list[index], self.method)
             if self.training:

@@ -13,6 +13,7 @@ from torch.autograd import Variable
 from torch.utils.data import DataLoader
 import torch.nn.functional as F
 from dataloader import DatasetFromList
+import numpy as np
 
 # Training settings
 parser = argparse.ArgumentParser(description='Train Stereo Matching Models')
@@ -29,11 +30,15 @@ parser.add_argument('--lr', type=float, default=0.001, help='Learning Rate. Defa
 parser.add_argument('--threads', type=int, default=0, help='number of threads for data loader to use')
 parser.add_argument('--seed', type=int, default=123, help='random seed to use. Default=123')
 parser.add_argument('--dataset', type=int, default=1, help='0: sceneflow_subset, 1: sceneflow, 3: kitti 2015')
-parser.add_argument('--whichModel', type=int, default=1, help='0: GANet, 1: ours')
+parser.add_argument('--whichModel', type=int, default=2, help='0: GANet, 1: PSMNet, 2: ours')
 parser.add_argument('--data_path', type=str, default='../../data/', help="data root")
-parser.add_argument('--save_path', type=str, default='./checkpoint/MCTNet/', help="location to save models")
+parser.add_argument('--save_path', type=str, default='./checkpoint/MCTNet/MCTNet_adv-3', help="location to save models")
 parser.add_argument('--local_rank', default=-1, type=int, help='node rank for distributed training')
 parser.add_argument('--backbone', type=bool, default=False, help='if the backbone is used')
+parser.add_argument('--adv_train', type=bool, default=False, help='adversarial training')
+parser.add_argument('--total_iter', type=int, default=3, help='iterations of PGD attack')
+parser.add_argument('--e', type=float, default=0.03, help='epsilon of PGD attack')
+parser.add_argument('--a', type=float, default=0.01, help='step size of PGD attack')
 opt = parser.parse_args()
 
 if opt.dataset == 1:
@@ -76,6 +81,12 @@ print('===> Building model')
 if opt.whichModel == 0:
     from models.GANet_deep import GANet
     model = GANet(opt.max_disp)
+elif opt.whichModel == 1:
+    from models.PSMNet import *
+    model = stackhourglass(opt.max_disp)
+elif opt.whichModel == 5:
+    from models.CompMatchDS3Feat import Model
+    model = Model(opt.max_disp)
 else:
     if opt.backbone:
         from models.MCTNet_backbone import Model
@@ -90,20 +101,78 @@ print("number of parameters:", pytorch_total_params)
 model = convert_syncbn_model(model).cuda()
 optimizer = optim.Adam(model.parameters(), lr=opt.lr, betas=(0.9, 0.999))
 model, optimizer = amp.initialize(model, optimizer, opt_level='O1')
-model = DistributedDataParallel(model)
+model = DistributedDataParallel(model, delay_allreduce=True)
 
 if opt.resume:
     if os.path.isfile(opt.resume):
         print("=> loading checkpoint '{}'".format(opt.resume))
         checkpoint = torch.load(opt.resume)
         model.load_state_dict(checkpoint['state_dict'], strict=False)
-        optimizer.load_state_dict(checkpoint['optimizer'])
-        if opt.whichModel==1:
-            amp.load_state_dict(checkpoint['amp'])
+        
+        # if opt.whichModel==2 or opt.whichModel==5:
+        #     optimizer.load_state_dict(checkpoint['optimizer'])
+        #     amp.load_state_dict(checkpoint['amp'])
     else:
         print("=> no checkpoint found at '{}'".format(opt.resume))
 
+
+def unconstrained_projected_gradient_descent(model, x1, x2, y, occ, num_steps, step_size, eps):
+    """unconstrained projected gradient descent attack"""
+    model.eval()
+
+    batch_size, channels, im_h, im_w = x1.detach().cpu().numpy().shape
+    x_adv = torch.zeros([batch_size, channels, im_h, im_w], requires_grad=True, device='cuda')
+    x2_adv = torch.zeros([batch_size, channels, im_h, im_w], requires_grad=True, device='cuda')
+    zero_plane = torch.zeros([batch_size, channels, im_h, im_w], requires_grad=False, device='cuda')
+    err_list = np.zeros(num_steps)
+
+    _x_adv = x_adv.clone().detach().requires_grad_(True)
+    _x2_adv = x2_adv.clone().detach().requires_grad_(True)
+
+    for i in range(num_steps):
+        _x_adv = x_adv.clone().detach().requires_grad_(True)
+        _x2_adv = x2_adv.clone().detach().requires_grad_(True)
+
+        input1 = x1 + _x_adv
+        input2 = x2 + _x2_adv
+
+        # compute disp and loss
+        if opt.whichModel==2:
+            prediction = model(input1, input2, attack=True)
+        elif opt.whichModel==1 and opt.dataset==1: # according to their repo, their disp need to *1.17 for SceneFLow
+            prediction = model(input1, input2) * opt.psm_constant
+        else:
+            prediction = model(input1, input2)
+        abs_diff = torch.abs(prediction[~occ] - y[~occ])
+        loss = torch.mean(abs_diff)
+
+        print("iter", i+1, "loss:", loss.item())
+
+        if i!=num_steps-1:
+            # loss.backward(retain_graph=True)
+            loss.backward()
+        else:
+            loss.backward()
+
+        with torch.no_grad():
+            # Force the gradient step to be a fixed size in a certain norm
+            gradients = _x_adv.grad.sign() * step_size
+            gradients_2 = _x2_adv.grad.sign() * step_size
+  
+            x_adv += gradients
+            x2_adv += gradients_2
+
+        # Project back into l_norm ball and correct range
+        x_adv = torch.max(torch.min(x_adv, zero_plane + eps), zero_plane - eps)
+        x2_adv = torch.max(torch.min(x2_adv, zero_plane + eps), zero_plane - eps)
+
+    input1 = x1 + x_adv
+    input2 = x2 + x2_adv
+
+    return input1.detach(), input2.detach()
+
 def train(epoch):
+    '''training'''
     train_sampler.set_epoch(epoch)
     model.train()
 
@@ -124,7 +193,12 @@ def train(epoch):
             optimizer.zero_grad()
 
             # get disparity and compute errors
-            disp1, disp2, disp3 = model(input1, input2)
+            if opt.adv_train:
+                x1, x2 = unconstrained_projected_gradient_descent(model, input1, input2, target, target>=opt.max_disp, opt.total_iter, opt.a, opt.e)
+                model.train()
+                disp1, disp2, disp3 = model(x1, x2)
+            else:
+                disp1, disp2, disp3 = model(input1, input2)
 
             disp1_loss = F.smooth_l1_loss(disp1[mask], target[mask], reduction='mean')
             disp2_loss = F.smooth_l1_loss(disp2[mask], target[mask], reduction='mean')
@@ -136,13 +210,14 @@ def train(epoch):
             optimizer.step()
 
             if opt.local_rank == 0:
-                print("===> Epoch[{}]({}/{}): Loss1: {:.4f}, Loss2: ({:.4f})".format(epoch, iteration,
+                print("===> Epoch[{}]({}/{}): Loss1: {:.4f}, Loss2: ({:.4f})".format(epoch, iteration+1,
                                                                                      len(training_data_loader),
                                                                                      disp1_loss.item(), disp3_loss.item()))
                 sys.stdout.flush()
 
 
 def val():
+    '''validation'''
     epoch_error = 0
     valid_iteration = 0
     three_px_acc_all = 0
@@ -181,6 +256,7 @@ def val():
     return three_px_acc_all / valid_iteration
 
 def save_checkpoint(save_path, epoch, state, is_best):
+    '''save checkpoint by filename'''
     filename = save_path + "_epoch_{}.pth".format(epoch)
     torch.save(state, filename)
     if is_best:
@@ -207,23 +283,27 @@ if __name__ == '__main__':
                     }, is_best)
             # for KITTI2015
             else:
-                # use validation error to keep track
-                loss = val()
-                if loss < error:
-                    error = loss
-                    is_best = True
+                if not opt.adv_train:
+                    # use validation error to keep track
+                    loss = val()
+                    if loss < error:
+                        error = loss
+                        is_best = True
 
-                if epoch % 100 == 0 and epoch >= 300:
-                    save_checkpoint(opt.save_path, epoch, {
-                        'epoch': epoch,
-                        'state_dict': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'amp': amp.state_dict()
-                    }, is_best)
-                if epoch >= 100 and is_best: # select the best one
-                    save_checkpoint(opt.save_path, epoch, {
-                        'epoch': epoch,
-                        'state_dict': model.state_dict(),
-                        'optimizer': optimizer.state_dict(),
-                        'amp': amp.state_dict()
-                    }, is_best)
+                    if epoch >= 20 and is_best: # select the best one
+                        save_checkpoint(opt.save_path, epoch, {
+                            'epoch': epoch,
+                            'state_dict': model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'amp': amp.state_dict()
+                        }, is_best)
+
+                else:       
+                    if epoch % 5 == 0 and epoch >= 1:
+                        save_checkpoint(opt.save_path, epoch, {
+                            'epoch': epoch,
+                            'state_dict': model.state_dict(),
+                            'optimizer': optimizer.state_dict(),
+                            'amp': amp.state_dict()
+                        }, is_best)
+

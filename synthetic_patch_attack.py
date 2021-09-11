@@ -23,12 +23,15 @@ parser.add_argument('--a', type=float, default=0.1, help='attack step size')
 parser.add_argument('--backbone', type=bool, default=False, help='if the backbone is used')
 parser.add_argument('--dataset', type=int, default=1, help='which parameters to used: 1. sceneflow, 3. kitti 2015')
 parser.add_argument('--test_patch_shift', type=bool, default=False, help='test on shifting the generated patch from disp 10-180')
+parser.add_argument('--adv_train', type=bool, default=False, help='use adv-trained params')
 opt = parser.parse_args()
 
 if not torch.cuda.is_available():
     raise Exception("No GPU found, please run without --cuda")
 
 torch.cuda.manual_seed(123)
+torch.manual_seed(123)
+
 
 # select the model
 print('===> Building model')
@@ -42,15 +45,19 @@ elif opt.whichModel == 1:
     from models.PSMNet import *
     model = stackhourglass(opt.max_disp)
     opt.resume = 'checkpoint/PSMNet/pretrained_model_KITTI2015.tar'
+    if opt.adv_train:
+        opt.resume = 'checkpoint/PSMNet/PSMNet_adv-3_epoch_20.pth'
     if opt.dataset == 1:
         opt.resume = 'checkpoint/PSMNet/pretrained_sceneflow.tar'
         opt.psm_constant = 1.17
     if opt.crop_height == 240:
         opt.crop_height = 256
-else:
+elif opt.whichModel == 2:
     if opt.backbone:
         from models.MCTNet_backbone import Model
         opt.resume = 'checkpoint/MCTNet/MCTNet_backbone_kitti.pth'
+        if opt.adv_train:
+            opt.resume = 'checkpoint/MCTNet/MCTNet_backbone_adv-2_epoch_20.pth'
         if opt.dataset == 1:
             opt.resume = 'checkpoint/MCTNet/MCTNet_backbone_sf_epoch_20.pth'
     else:
@@ -58,9 +65,16 @@ else:
         opt.resume = 'checkpoint/MCTNet/MCTNet_kitti.pth'
         if opt.dataset == 1:
             opt.resume = 'checkpoint/MCTNet/MCTNet_sf_epoch_20.pth'
-
     model = Model(opt.max_disp)
     model.training = False
+elif opt.whichModel == 5:
+    from models.CompMatchDS3Feat import Model
+    opt.resume = 'checkpoint/CompMatchDS3Feat/kitti_epoch_413_best.pth'
+    if opt.dataset == 1:
+        opt.resume = 'checkpoint/CompMatchDS3Feat/_epoch_20.pth'
+    if opt.adv_train:
+        opt.resume = 'checkpoint/CompMatchDS3Feat/adv-3_epoch_20.pth'
+    model = Model(opt.max_disp)    
 print(opt)
 
 model = torch.nn.DataParallel(model).cuda()
@@ -144,11 +158,6 @@ def projected_gradient_descent(model, x1, x2, y,  num_steps, step_size, step_nor
             if step_norm == 'inf':
                 # only consider the patch
                 gradients = _x_adv_patch.grad.sign() * step_size
-            else:
-                # Note .view() assumes batched image data as 4D tensor
-                gradients = _x_adv_patch.grad * step_size / _x_adv_patch.grad.view(_x_adv_patch.shape[0], -1) \
-                    .norm(step_norm, dim=-1) \
-                    .view(-1, num_channels, 1, 1)
 
             # update the patch perturbation
             noise_patch += gradients
@@ -181,7 +190,7 @@ def projected_gradient_descent(model, x1, x2, y,  num_steps, step_size, step_nor
     input2_noise = input2_noise.reshape(batch_size, channels, im_h, im_w)
 
     prediction = model(input_extract, input2_noise)
-    if opt.whichModel == 1:
+    if opt.whichModel == 1 and opt.dataset == 1:
         prediction = prediction * opt.psm_constant
 
     # show after loss within the patch
@@ -213,6 +222,7 @@ if __name__ == '__main__':
     y_a, y_b, x_a, x_b = ph_y - ph_size, ph_y + ph_size + 1, ph_x - ph_size, ph_x + ph_size + 1
 
     # intialize the adversarial patch
+    np.random.seed(0)
     noise_patch = np.random.randn(1, 3, ph_size * 2 + 1, ph_size * 2 + 1)
     input1_np[:, :, y_a:y_b, x_a + gt:x_b + gt] = noise_patch
     input2_np[:, :, y_a:y_b, x_a :x_b] = noise_patch
@@ -220,8 +230,14 @@ if __name__ == '__main__':
     target_np[:, :, y_a:y_b, x_a + gt:x_b + gt] = gt
 
     # set 0 and 1 as boundary values
-    rgb_min_l = rgb_min_r = np.array([0.0, 0.0, 0.0])
-    rgb_max_l = rgb_max_r = np.array([1.0, 1.0, 1.0])
+    mean_left = mean_right = np.array([0.485, 0.456, 0.406])
+    std_left = std_right = np.array([0.229, 0.224, 0.225])
+
+    # rgb_min_l = rgb_min_r = np.array([0.0, 0.0, 0.0])
+    # rgb_max_l = rgb_max_r = np.array([1.0, 1.0, 1.0])
+
+    rgb_min_l = rgb_min_r = -mean_left / std_left
+    rgb_max_l = rgb_max_r = (1.0 - mean_left) / std_left
 
     rgb_min_l = torch.tensor(rgb_min_l).cuda().float()
     rgb_min_r = torch.tensor(rgb_min_r).cuda().float()
@@ -294,21 +310,21 @@ if __name__ == '__main__':
         np.savetxt("patch_attack_list_" + str(opt.whichModel) + ".csv", patch_attack_list, delimiter=",")
 
     # store attacked images
-    mean_left = mean_right = np.array([0.485, 0.456, 0.406])
-    std_left = std_right = np.array([0.229, 0.224, 0.225])
+    # mean_left = mean_right = np.array([0.485, 0.456, 0.406])
+    # std_left = std_right = np.array([0.229, 0.224, 0.225])
 
-    temp = x1.detach().cpu().numpy().squeeze()
-    temp = np.moveaxis(temp, 0, -1)
-    temp = inverse_normalize(temp, mean_left, std_left)
-    print(temp.shape)
+    # temp = x1.detach().cpu().numpy().squeeze()
+    # temp = np.moveaxis(temp, 0, -1)
+    # temp = inverse_normalize(temp, mean_left, std_left)
+    # print(temp.shape)
 
-    post_fname = 'model_' + str(opt.whichModel) + '.png'
-    savename = './' + 'patch_attack_left_' + post_fname
-    skimage.io.imsave(savename, (temp * 255).astype('uint8'))
+    # post_fname = 'model_' + str(opt.whichModel) + '.png'
+    # savename = './' + 'patch_attack_left_' + post_fname
+    # skimage.io.imsave(savename, (temp * 255).astype('uint8'))
 
-    temp = x2.detach().cpu().numpy().squeeze()
-    temp = np.moveaxis(temp, 0, -1)#.astype('uint16')
-    temp = inverse_normalize(temp, mean_right, std_right)
-    print(temp.shape)
-    savename = './' + 'patch_attack_right_' + post_fname
-    skimage.io.imsave(savename, (temp * 255).astype('uint8'))
+    # temp = x2.detach().cpu().numpy().squeeze()
+    # temp = np.moveaxis(temp, 0, -1)#.astype('uint16')
+    # temp = inverse_normalize(temp, mean_right, std_right)
+    # print(temp.shape)
+    # savename = './' + 'patch_attack_right_' + post_fname
+    # skimage.io.imsave(savename, (temp * 255).astype('uint8'))

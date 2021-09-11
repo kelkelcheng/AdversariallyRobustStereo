@@ -21,12 +21,16 @@ parser.add_argument('--e', type=float, default=0.03, help='epsilon of PGD attack
 parser.add_argument('--a', type=float, default=0.01, help='step size of PGD attack')
 parser.add_argument('--double_occ', type=bool, default=False, help='if occlusion of the right image is excluded')
 parser.add_argument('--backbone', type=bool, default=False, help='if the backbone is used')
-parser.add_argument('--unconstrained_attack', type=bool, default=False, help='if the backbone is used')
+parser.add_argument('--unconstrained_attack', type=bool, default=False, help='use unconstrained attack')
+parser.add_argument('--use_pred', type=bool, default=False, help='use pred for unconstrained attacks')
+parser.add_argument('--occ', type=bool, default=False, help='if using the occluded disp maps for KITTI2015')
+parser.add_argument('--random', type=bool, default=False, help='use random initialization')
+parser.add_argument('--adv_train', type=bool, default=False, help='use adv-trained params')
 opt = parser.parse_args()
 
 # select file list according to dataset
 if opt.dataset == 1:
-    opt.test_data_path = opt.data_path + 'FT_subset/val/'
+    opt.test_data_path = opt.data_path + 'FlyingThings3D_subset/val/'
     opt.val_list = './lists/sceneflow_subset_val_1000.list'
 elif opt.dataset == 2:
     opt.test_data_path = opt.data_path + 'KITTI2012/training/'
@@ -34,6 +38,7 @@ elif opt.dataset == 2:
 else:
     opt.test_data_path = opt.data_path + 'KITTI2015/training/'
     opt.val_list = './lists/kitti2015_train.list'
+    # opt.val_list = './lists/kitti2015_val_new.list'
 
 if not torch.cuda.is_available():
     raise Exception("No GPU found, please run without --cuda")
@@ -50,26 +55,41 @@ elif opt.whichModel == 1:
     from models.PSMNet import *
     model = stackhourglass(opt.max_disp)
     opt.resume = 'checkpoint/PSMNet/pretrained_model_KITTI2015.tar'
+    if opt.adv_train:
+        opt.resume = 'checkpoint/PSMNet/PSMNet_adv-3_epoch_20.pth'
     if opt.dataset == 1:
         opt.resume = 'checkpoint/PSMNet/pretrained_sceneflow.tar'
         opt.psm_constant = 1.17
     if opt.crop_height == 240:
         opt.crop_height = 256
-else:
+elif opt.whichModel == 2:
     if opt.backbone:
         from models.MCTNet_backbone import Model
         opt.resume = 'checkpoint/MCTNet/MCTNet_backbone_kitti.pth'
+        if opt.adv_train:
+            opt.resume = 'checkpoint/MCTNet/MCTNet_backbone_adv-3_epoch_20.pth'
         if opt.dataset == 1:
             opt.resume = 'checkpoint/MCTNet/MCTNet_backbone_sf_epoch_20.pth'
     else:
         from models.MCTNet import Model
         opt.resume = 'checkpoint/MCTNet/MCTNet_kitti.pth'
+        if opt.adv_train:
+            opt.resume = 'checkpoint/MCTNet/MCTNet_adv-3_epoch_20.pth'
         if opt.dataset == 1:
             opt.resume = 'checkpoint/MCTNet/MCTNet_sf_epoch_20.pth'
 
     model = Model(opt.max_disp)
     model.training = False
-
+elif opt.whichModel == 5:
+    from models.CompMatchDS3Feat import Model
+    opt.resume = 'checkpoint/CompMatchDS3Feat/kitti_epoch_413_best.pth'
+    if opt.adv_train:
+        opt.resume = 'checkpoint/CompMatchDS3Feat/adv-3_epoch_20.pth'
+        # opt.resume = 'checkpoint/CompMatchDS3Feat/fgsm_epoch_20.pth'
+    model = Model(opt.max_disp)
+    model.training = False
+    
+torch.manual_seed(0)
 print(opt)
 print("load parameters:", opt.resume)
 model = torch.nn.DataParallel(model).cuda()
@@ -84,9 +104,11 @@ if opt.resume:
         print("=> no checkpoint found at '{}'".format(opt.resume))
 
 def fetch_data(A, crop_height=240, crop_width=576):
+    ''' self-contained data extraction '''
+    # parse data name
     if opt.dataset == 1:
-        filename_l = opt.test_data_path + 'frames_finalpass/' + A[0: len(A) - 1]
-        filename_r = opt.test_data_path + 'frames_finalpass/' + 'right/' + A[5:len(A) - 1]
+        filename_l = opt.test_data_path + 'image_clean/' + A[0: len(A) - 1]
+        filename_r = opt.test_data_path + 'image_clean/' + 'right/' + A[5:len(A) - 1]
 
         filename_disp = opt.test_data_path + 'disparity/' + A[0: len(A) - 4] + 'pfm'
         disp_left, height, width = readPFM(filename_disp)
@@ -105,18 +127,31 @@ def fetch_data(A, crop_height=240, crop_width=576):
         occ_right = np.asarray(occ_right)
         occ_right = occ_right | (occ_right >= opt.max_disp)
 
+    elif opt.dataset == 2:
+        filename_l = opt.test_data_path + 'colored_0/' + A[0: len(A) - 1]
+        filename_r = opt.test_data_path + 'colored_1/' + A[0: len(A) - 1]
+        filename_disp = opt.test_data_path + 'disp_noc/' + A[0: len(A) - 1]
+        disp_left = np.asarray(Image.open(filename_disp)).astype(float)
+        disp_right = disp_left.copy()
+
     elif opt.dataset == 3:
         filename_l = opt.test_data_path + 'image_2/' + A[0: len(A) - 1]
         filename_r = opt.test_data_path + 'image_3/' + A[0: len(A) - 1]
-        filename_disp = opt.test_data_path + 'disp_noc_0/' + A[0: len(A) - 1]
-        filename_disp_2 = opt.test_data_path + 'disp_noc_1/' + A[0: len(A) - 1]
+        if not opt.occ:
+            filename_disp = opt.test_data_path + 'disp_noc_0/' + A[0: len(A) - 1]
+            filename_disp_2 = opt.test_data_path + 'disp_noc_1/' + A[0: len(A) - 1]
+        else:
+            filename_disp = opt.test_data_path + 'disp_occ_0/' + A[0: len(A) - 1]
+            filename_disp_2 = opt.test_data_path + 'disp_occ_1/' + A[0: len(A) - 1]     
+
         disp_left = np.asarray(Image.open(filename_disp)).astype(float)
         disp_right = np.asarray(Image.open(filename_disp_2)).astype(float)
 
+    # read data
     left = Image.open(filename_l)
     right = Image.open(filename_r)
 
-    # cast to float
+    # initialize for normalization and cropping
     size = np.shape(left)
     height = size[0]
     width = size[1]
@@ -204,19 +239,23 @@ def fetch_data(A, crop_height=240, crop_width=576):
 
 def unconstrained_projected_gradient_descent(model, x1, x2, y, occ, num_steps, step_size, step_norm, eps, eps_norm,
                                rgb_min_l, rgb_max_l, rgb_min_r, rgb_max_r):
-    """Performs the projected gradient descent attack on a batch of images."""
-    # new
+    """unconstrained projected gradient descent attack"""
+    # initialization
     batch_size, channels, im_h, im_w = x1.detach().cpu().numpy().shape
     x_adv = torch.zeros([batch_size, channels, im_h, im_w], requires_grad=True, device='cuda')
     x2_adv = torch.zeros([batch_size, channels, im_h, im_w], requires_grad=True, device='cuda')
     zero_plane = torch.zeros([batch_size, channels, im_h, im_w], requires_grad=False, device='cuda')
     err_list = np.zeros(num_steps)
 
+    # initialize the perturbation randomly
+    if opt.random:
+        x_adv = torch.rand_like(x1, requires_grad=True, device='cuda') * 2 * opt.e - opt.e
+        x2_adv = torch.rand_like(x2, requires_grad=True, device='cuda') * 2 * opt.e - opt.e
+
     _x_adv = x_adv.clone().detach().requires_grad_(True)
     _x2_adv = x2_adv.clone().detach().requires_grad_(True)
 
     for i in range(num_steps):
-        # new
         _x_adv = x_adv.clone().detach().requires_grad_(True)
         _x2_adv = x2_adv.clone().detach().requires_grad_(True)
 
@@ -234,7 +273,7 @@ def unconstrained_projected_gradient_descent(model, x1, x2, y, occ, num_steps, s
         # compute disp and loss
         if opt.whichModel==2:
             prediction = model(input1, input2, attack=True)
-        elif opt.whichModel==1 and opt.dataset==1: # according to their repo, they disp need to *1.17 for SceneFLow
+        elif opt.whichModel==1 and opt.dataset==1: # according to their repo, their disp need to *1.17 for SceneFLow
             prediction = model(input1, input2) * opt.psm_constant
         else:
             prediction = model(input1, input2)
@@ -263,8 +302,8 @@ def unconstrained_projected_gradient_descent(model, x1, x2, y, occ, num_steps, s
             x_adv = torch.max(torch.min(x_adv, zero_plane + eps), zero_plane - eps)
             x2_adv = torch.max(torch.min(x2_adv, zero_plane + eps), zero_plane - eps)
 
-    input1 = x1 + _x_adv
-    input2 = x2 + _x2_adv
+    input1 = x1 + x_adv
+    input2 = x2 + x2_adv
 
     input1 = input1.reshape(im_h, im_w, channels)
     input1 = torch.max(torch.min(input1, rgb_max_l), rgb_min_l)
@@ -279,10 +318,15 @@ def unconstrained_projected_gradient_descent(model, x1, x2, y, occ, num_steps, s
 
 def projected_gradient_descent(model, x1, x2, y, occ, mask, occ_mask, occ_2_mask, num_steps, step_size, step_norm, eps, eps_norm,
                                rgb_min_l, rgb_max_l, rgb_min_r, rgb_max_r):
-    """Performs the projected gradient descent attack on a batch of images."""
+    """stereo-constrained projected gradient descent attack"""
     # initialization
     batch_size, channels, im_h, im_w = x1.detach().cpu().numpy().shape
     noise = torch.zeros([batch_size, channels, im_h, im_w], requires_grad=True, device='cuda')
+    
+    if opt.random:
+        noise = torch.rand_like(x1, requires_grad=True, device='cuda')
+        noise.data = noise.data * 2 * opt.e - opt.e
+
     zero_plane = torch.zeros([batch_size, channels, im_h, im_w], requires_grad=False, device='cuda')
     assert (channels == 3)
     num_channels = noise.shape[1]
@@ -295,7 +339,7 @@ def projected_gradient_descent(model, x1, x2, y, occ, mask, occ_mask, occ_2_mask
         input2_noise = x2 + _x_adv
 
         # fetch correspondence from the right image
-        noise_extract = torch.gather(_x_adv, channels, mask)
+        noise_extract = torch.gather(_x_adv, 3, mask)
         noise_extract[occ_mask] = zero_plane[occ_mask]
         input_extract = x1 + noise_extract
 
@@ -334,11 +378,6 @@ def projected_gradient_descent(model, x1, x2, y, occ, mask, occ_mask, occ_2_mask
             # Force the gradient step to be a fixed size in a certain norm
             if step_norm == 'inf':
                 gradients = _x_adv.grad.sign() * step_size
-            else:
-                # Note .view() assumes batched image data as 4D tensor
-                gradients = _x_adv.grad * step_size / _x_adv.grad.view(_x_adv.shape[0], -1) \
-                    .norm(step_norm, dim=-1) \
-                    .view(-1, num_channels, 1, 1)
 
             # update the perturbation
             noise += gradients
@@ -350,14 +389,7 @@ def projected_gradient_descent(model, x1, x2, y, occ, mask, occ_mask, occ_2_mask
             # double_occ=True disable the occluded regions of the right image
             if opt.double_occ:
                 noise[occ_2_mask] = zero_plane[occ_2_mask]
-        else:
-            mask = noise.view(noise.shape[0], -1).norm(eps_norm, dim=1) <= eps
 
-            scaling_factor = noise.view(noise.shape[0], -1).norm(eps_norm, dim=1)
-            scaling_factor[mask] = eps
-
-            # .view() assumes batched images as a 4D Tensor
-            noise *= eps / scaling_factor.view(-1, 1, 1, 1)
 
     # apply the final iteration
     if opt.double_occ:
@@ -436,7 +468,8 @@ if __name__ == '__main__':
         mask = mask.round().long()
 
         # set those with out-of-crop correspondence as occluded
-        occ = occ | (mask < 0)
+        if not opt.occ:
+            occ = occ | (mask < 0)
         occ = torch.squeeze(occ, 1)
 
         mask = torch.clamp(mask, 0, opt.crop_width - 1)
@@ -447,7 +480,8 @@ if __name__ == '__main__':
         mask2 = mask2.repeat(target2.size()[0], target2.size()[1], target2.size()[2], 1)
         mask2 = mask2 + target2
 
-        occ_2 = occ_2 | (mask2 >= opt.crop_width)
+        if not opt.occ:
+            occ_2 = occ_2 | (mask2 >= opt.crop_width)
         occ_2 = torch.squeeze(occ_2, 1)
 
         # occ_mask is occ repeated for RGB channels
@@ -467,7 +501,7 @@ if __name__ == '__main__':
 
         # the error before attacks
         ori_disp = model(input1, input2).detach()
-        if opt.whichModel==1 and opt.dataset==1: # according to their repo, they disp need to *1.17 for SceneFLow
+        if opt.whichModel==1 and opt.dataset==1: # according to their repo, the disp need to *1.17 for SceneFLow
             ori_disp = ori_disp * opt.psm_constant
         before_loss = torch.mean(torch.abs(ori_disp[~occ] - target[~occ])).detach()
         print("data", data_num, "before_loss", before_loss.item())
@@ -482,6 +516,15 @@ if __name__ == '__main__':
                                                 rgb_min_l=rgb_min_l, rgb_max_l=rgb_max_l,
                                                 rgb_min_r=rgb_min_r, rgb_max_r=rgb_max_r)
         # unconstrained attack
+        elif opt.use_pred:
+            target = ori_disp
+            occ = ori_disp>=opt.max_disp
+            x1, x2, err_list = unconstrained_projected_gradient_descent(model, input1, input2, ori_disp, ori_disp>=opt.max_disp,
+                                                                        num_steps=opt.total_iter, step_size=opt.a,
+                                                                        eps=opt.e, eps_norm='inf',
+                                                                        step_norm='inf',
+                                                                        rgb_min_l=rgb_min_l, rgb_max_l=rgb_max_l,
+                                                                        rgb_min_r=rgb_min_r, rgb_max_r=rgb_max_r)            
         else:
             x1, x2, err_list = unconstrained_projected_gradient_descent(model, input1, input2, target, occ,
                                                                         num_steps=opt.total_iter, step_size=opt.a,
@@ -493,7 +536,7 @@ if __name__ == '__main__':
 
         # the error after attacks
         attack_disp = model(x1, x2).detach()
-        if opt.whichModel==1 and opt.dataset==1: # according to their repo, they disp need to *1.17 for SceneFLow
+        if opt.whichModel==1 and opt.dataset==1: # according to their repo, their disp need to *1.17 for SceneFLow
             attack_disp = attack_disp * opt.psm_constant
         after_loss = torch.mean(torch.abs(attack_disp[~occ] - target[~occ])).detach()
         print("data", data_num, "after_loss", after_loss.item())

@@ -7,7 +7,7 @@ from dataloader import readPFM
 import numpy as np
 from PIL import Image
 
-# Training settings
+# test settings
 parser = argparse.ArgumentParser(description='Evaluation of Stereo Matching Models')
 parser.add_argument('--max_disp', type=int, default=192, help="max disp")
 parser.add_argument('--data_path', type=str, default='../../data/', help="data root")
@@ -82,6 +82,8 @@ if opt.resume:
 
 
 def fetch_data(A, crop_height, crop_width):
+    ''' self-contained data extraction '''
+    # parse data name
     if opt.dataset == 1:
         filename_l = opt.test_data_path + 'frames_finalpass/' + A[0: len(A) - 1]
         filename_r = opt.test_data_path + 'frames_finalpass/' + A[0: len(A) - 14] + 'right/' + A[len(A) - 9:len(A) - 1]

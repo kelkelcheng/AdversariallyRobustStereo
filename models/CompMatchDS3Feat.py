@@ -1,13 +1,24 @@
+# -*- coding: utf-8 -*-
+"""
+Created on Thu Dec  3 00:08:31 2020
+
+@author: B016
+"""
+
 import torch
 import torch.nn as nn
 import torch.nn.init as init
+
 import torch.nn.functional as F
 from torch.autograd import Variable
 import numpy as np
 
+
 class BasicConv(nn.Module):
+
     def __init__(self, in_channels, out_channels, deconv=False, is_3d=False, bn=True, relu=True, **kwargs):
         super(BasicConv, self).__init__()
+        #        print(in_channels, out_channels, deconv, is_3d, bn, relu, kwargs)
         self.relu = relu
         self.use_bn = bn
         if is_3d:
@@ -31,7 +42,9 @@ class BasicConv(nn.Module):
         x = self.conv(x)
         return x
 
+
 class Conv2x(nn.Module):
+
     def __init__(self, in_channels, out_channels, deconv=False, is_3d=False, concat=True, bn=True, relu=True,
                  is_conv2=True):
         super(Conv2x, self).__init__()
@@ -45,9 +58,11 @@ class Conv2x(nn.Module):
             ss = (2, 2, 2)
             pd = (1, 1, 1)
             op = (1, 1, 1)
+            #            kernel = 3
             self.conv1 = BasicConv(in_channels, out_channels, deconv, is_3d, bn=True, relu=True, kernel_size=ks,
                                    stride=ss, padding=pd, output_padding=op)
         elif deconv:
+            #            kernel = 4
             self.conv1 = BasicConv(in_channels, out_channels, deconv, is_3d, bn=True, relu=True, kernel_size=3,
                                    stride=2, padding=1, output_padding=1)
         else:
@@ -63,6 +78,7 @@ class Conv2x(nn.Module):
 
     def forward(self, x, rem):
         x = self.conv1(x)
+        # print(x.size(), rem.size())
         assert (x.size() == rem.size())
         if self.concat:
             x = torch.cat((x, rem), 1)
@@ -82,17 +98,21 @@ class HGFeature(nn.Module):
             BasicConv(32, 32, kernel_size=3, padding=1))
         self.conv1a = BasicConv(32, 48, kernel_size=3, stride=2, padding=1)
         self.conv2a = BasicConv(48, 64, kernel_size=3, stride=2, padding=1)
-        self.conv3a = BasicConv(64, 64, kernel_size=3, stride=2, padding=1)
+        self.conv3a = BasicConv(64, 96, kernel_size=3, stride=2, padding=1)
+        self.conv4a = BasicConv(96, 128, kernel_size=3, stride=2, padding=1)
 
-        self.deconv3a = Conv2x(64, 64, deconv=True)
+        self.deconv4a = Conv2x(128, 96, deconv=True)
+        self.deconv3a = Conv2x(96, 64, deconv=True)
         self.deconv2a = Conv2x(64, 48, deconv=True)
         self.deconv1a = Conv2x(48, 32, deconv=True)
 
         self.conv1b = Conv2x(32, 48)
         self.conv2b = Conv2x(48, 64)
-        self.conv3b = Conv2x(64, 64)
+        self.conv3b = Conv2x(64, 96)
+        self.conv4b = Conv2x(96, 128)
 
-        self.deconv3b = Conv2x(64, 64, deconv=True)
+        self.deconv4b = Conv2x(128, 96, deconv=True)
+        self.deconv3b = Conv2x(96, 64, deconv=True)
         self.deconv2b = Conv2x(64, 48, deconv=True)
         self.deconv1b = Conv2x(48, 32, deconv=True)
 
@@ -104,6 +124,10 @@ class HGFeature(nn.Module):
         x = self.conv2a(x)
         rem2 = x
         x = self.conv3a(x)
+        rem3 = x
+        x = self.conv4a(x)
+        rem4 = x
+        x = self.deconv4a(x, rem3)
         rem3 = x
 
         x = self.deconv3a(x, rem2)
@@ -118,95 +142,34 @@ class HGFeature(nn.Module):
         x = self.conv2b(x, rem2)
         rem2 = x
         x = self.conv3b(x, rem3)
+        rem3 = x
+        x = self.conv4b(x, rem4)
 
+        x = self.deconv4b(x, rem3)
         x = self.deconv3b(x, rem2)
         x = self.deconv2b(x, rem1)
         x = self.deconv1b(x, rem0)
 
         return x
 
-
-class CensusTransform(nn.Module):
-    def __init__(self, wd=11):
-        super(CensusTransform, self).__init__()
-        self.wd = wd
-        self.wd_hf = int(wd / 2)
-        self.size = wd * wd -1
-
-        self.offsets = []
-        for i in range(1, self.wd_hf + 1):
-            temp = [(u, v) for v in range(self.wd_hf - i, self.wd_hf + i + 1) for u in range(self.wd_hf - i, self.wd_hf + i + 1) if
-                    (not u == self.wd_hf == v and not (u, v) in self.offsets)]
-            self.offsets += temp
-
-    def forward(self, x, attack=False):
-        with torch.cuda.device_of(x):
-            n, c, h, w = x.size()
-            x = torch.mean(x, dim=1, keepdim=True)
-            x_new = F.pad(x, (self.wd_hf, self.wd_hf, self.wd_hf, self.wd_hf), mode='reflect')
-            # x_new = F.pad(x, (self.wd_hf, self.wd_hf, self.wd_hf, self.wd_hf), mode='constant')
-
-            if not attack:
-                census = torch.zeros((n, self.size, h, w), dtype=torch.bool, device=x.device)
-                for i, (u, v) in enumerate(self.offsets):
-                    census[:, i, :, :] = x_new[:, 0, v:v + h, u:u + w] >= x[:, 0, :, :]
-            else:
-                # differentiable alternative
-                census = torch.zeros((n, self.size, h, w), dtype=torch.float, device=x.device)
-                for i, (u, v) in enumerate(self.offsets):
-                    census[:,i,:,:] = torch.sigmoid((x_new[:, 0, v:v + h, u:u + w] - x[:, 0, :, :])*100000) # multiply by a large constant
-
-        return census
-
 class GetCostVolume(nn.Module):
     def __init__(self, maxdisp):
         super(GetCostVolume, self).__init__()
         self.maxdisp = maxdisp
 
-    def forward(self, x, y, attack=False):
+    def forward(self, x, y):
+        assert(x.is_contiguous() == True)
         with torch.cuda.device_of(x):
             num, channels, height, width = x.size()
-            cost = torch.zeros((num, 9, self.maxdisp, height, width), dtype=torch.float, device=x.device)
-
-            if not attack:
-                for i in range(self.maxdisp):
-                    if i > 0:
-                        for k in range(3, 12):
-                            idx = k * k
-                            cost[:, k - 3, i, :, i:] = torch.mean((x[:, :idx, :, i:] != y[:, :idx, :, :-i]).float(), dim=1)
-                    else:
-                        for k in range(3, 12):
-                            idx = k * k
-                            cost[:, k - 3, i, :, i:] = torch.mean((x[:, :idx, :, :] != y[:, :idx, :, :]).float(), dim=1)
-            else:
-                for i in range(self.maxdisp):
-                    if i > 0:
-                        for k in range(3, 12):
-                            idx = k * k
-                            cost[:, k - 3, i, :, i:] = torch.mean(torch.abs(x[:, :idx, :, i:] - y[:, :idx, :, :-i]), dim=1)
-
-                    else:
-                        for k in range(3, 12):
-                            idx = k * k
-                            cost[:, k - 3, i, :, :] = torch.mean(torch.abs(x[:, :idx, :, :] - y[:, :idx, :, :]), dim=1)
-
-            cost = cost.contiguous()
-        return cost
-
-class FeatToCV(nn.Module):
-    def __init__(self, maxdisp):
-        super(FeatToCV, self).__init__()
-        self.maxdisp = int(maxdisp/3)
-
-    def forward(self, x):
-        with torch.cuda.device_of(x):
-            num, channels, height, width = x.size()
-            cost = x.new().resize_(num, channels, self.maxdisp, height, width).zero_()
+            cost = x.new().resize_(num, channels * 2, self.maxdisp, height, width).zero_()
             for i in range(self.maxdisp):
-                if i > 0:
-                    cost[:, :, i, :, i:] = x[:, :, :, i:]
+                if i > 0 :
+                    cost[:, :x.size()[1], i, :,i:]   = x[:,:,:,i:]
+                    cost[:, x.size()[1]:, i, :,i:]   = y[:,:,:,:-i]
                 else:
-                    cost[:, :, i, :, :] = x
+                    cost[:, :x.size()[1], i, :,:]   = x
+                    cost[:, x.size()[1]:, i, :,:]   = y
+
             cost = cost.contiguous()
         return cost
 
@@ -227,6 +190,7 @@ class DisparityRegression(nn.Module):
 
 
 class Disp(nn.Module):
+
     def __init__(self, maxdisp=192):
         super(Disp, self).__init__()
         self.maxdisp = maxdisp
@@ -248,8 +212,9 @@ class CostRefine(nn.Module):
         ss = (2, 2, 2)
         pd = (1, 1, 1)
 
-        c2 = c
-        c4 = c
+        c2 = c  # *2
+        c4 = c  # *4
+        # c8 = c*8
 
         self.maxdisp = maxdisp
 
@@ -311,24 +276,22 @@ class Model(nn.Module):
         super(Model, self).__init__()
         self.training = training
         self.maxdisp = maxdisp
-        self.feat_cv = FeatToCV(self.maxdisp)
-        self.census = CensusTransform()
-        self.cv = GetCostVolume(self.maxdisp)
+        self.feature = HGFeature()
+        self.cv = GetCostVolume(int(self.maxdisp/3))
         self.cost_refine_1 = CostRefine(self.maxdisp, c)
         self.cost_refine_2 = CostRefine(self.maxdisp, c)
         self.cost_refine_3 = CostRefine(self.maxdisp, c)
         self.disp = Disp(self.maxdisp)
 
-
-        self.conv_start = BasicConv(9, c, is_3d=True, kernel_size=5, stride=3, padding=2)
-        self.conv_start_2 = BasicConv(c, c, is_3d=True, kernel_size=3, padding=1)
-
+        # self.conv_start = BasicConv(3, c, is_3d=True, kernel_size=5, stride=3, padding=2)
+        self.conv_start = BasicConv(c * 2, c, is_3d=True, kernel_size=1, padding=0)
         self.deconv_1 = BasicConv(c, 1, deconv=True, is_3d=True, bn=True, relu=True, kernel_size=5, stride=3, padding=2,
                                 output_padding=(2, 2, 2))
         self.deconv_2 = BasicConv(c, 1, deconv=True, is_3d=True, bn=True, relu=True, kernel_size=5, stride=3, padding=2,
                                 output_padding=(2, 2, 2))
         self.deconv_3 = BasicConv(c, 1, deconv=True, is_3d=True, bn=True, relu=True, kernel_size=5, stride=3, padding=2,
                                 output_padding=(2, 2, 2))
+        # self.final_conv = BasicConv(c, 1, is_3d=True, bn=True, relu=True, kernel_size=1)
 
         for m in self.modules():
             if isinstance(m, (nn.Conv2d, nn.Conv3d)):
@@ -337,17 +300,16 @@ class Model(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, y, attack=False):
-        x_c = self.census(x, attack=attack)
-        y_c = self.census(y, attack=attack)
-        cv = self.cv(x_c, y_c, attack=attack)
-
+    def forward(self, x, y):
+        x = self.feature(x)
+        y = self.feature(y)
+        cv = self.cv(x, y)
         cv = self.conv_start(cv)
-        cv = self.conv_start_2(cv)
-
         cv1 = self.cost_refine_1(cv)
         cv2 = self.cost_refine_2(cv1)
         cv3 = self.cost_refine_3(cv2)
+        # cv = self.final_conv(cv)
+        # cv = F.interpolate(cv, [self.maxdisp, cv.size()[3] * 3, cv.size()[4] * 3], mode='trilinear', align_corners=False)
 
         cv3 = self.deconv_3(cv3)
         exp_disp_3 = self.disp(cv3)
@@ -358,5 +320,4 @@ class Model(nn.Module):
             exp_disp_1 = self.disp(cv1)
             exp_disp_2 = self.disp(cv2)
             return exp_disp_1, exp_disp_2, exp_disp_3
-
         return exp_disp_3
